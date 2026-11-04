@@ -80,3 +80,8 @@ Useful flags: `--n-cases N` (quick test), `--no-reasoning` (answer only, much fa
 - The paper fits on 500 cases. With fewer than 30 cases, `extract_model_belief.py` fits
   everything in-sample and says so.
 - `option_probs` and the activations are our additions.
+- Sampling: temperature 1 as in the paper, but we keep the model's own top-p/top-k by default.
+  Without them, Qwen 0.5B/1.5B drift into gibberish and Chinese at temperature 1. Use
+  `--pure-sampling` for the paper's exact setting.
+- Speed on an M4 Mac with Qwen2.5-1.5B: about 11 minutes per case with reasoning, much faster
+  with `--no-reasoning`.
