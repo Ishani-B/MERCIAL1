@@ -23,6 +23,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import re
 import time
@@ -38,6 +39,7 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 POSITIONS = ["context_end", "prompt_end", "answer"]
 
 PROB_RE = re.compile(r'"probability"\s*:\s*"?([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*(%?)')
+BARE_RE = re.compile(r"\s*\**\(?([A-E])(?:[.):]|\s*$|\s)")
 CHOICE_RE = re.compile(r"(?:[Cc]hoice|[Aa]nswer|ANSWER)\s*:?\s*\**\s*(?:[Oo]ption\s+)?\(?([A-E])\b(?!\w)")
 
 
@@ -56,6 +58,9 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--no-reasoning", action="store_true", help="ask for the answer only, no reasoning")
     p.add_argument("--no-activations", action="store_true")
+    p.add_argument("--flip-options", action="store_true",
+                   help="show every multiple-choice question with its options in reverse order (controls for "
+                        "letter bias). Saved answers are mapped back to the original order")
     p.add_argument("--tag", default="", help="extra label for the run directory")
     p.add_argument("--out", default="outputs")
     p.add_argument("--device", default="auto", help="auto | mps | cuda | cpu")
@@ -126,6 +131,8 @@ def parse_answer(kind: str, text: str, n_options: int):
     m = None
     for m in CHOICE_RE.finditer(text):
         pass
+    if m is None and len(text.strip()) <= 60:  # short bare answer: "B", "E. Very likely" (--no-reasoning)
+        m = BARE_RE.match(text)
     if m is None:
         return None, None
     i = LETTERS.index(m.group(1))
@@ -218,7 +225,8 @@ def main():
     dtype = pick_dtype(args.dtype, device)
     model_slug = args.model.split("/")[-1] + (f"+{args.adapter.split('/')[-1]}" if args.adapter else "")
     run_name = "__".join(x for x in [scenario["domain"], model_slug, args.tag,
-                                     "noreason" if args.no_reasoning else ""] if x)
+                                     "noreason" if args.no_reasoning else "",
+                                     "flip" if args.flip_options else ""] if x)
     out_dir = Path(args.out) / run_name
     (out_dir / "activations").mkdir(parents=True, exist_ok=True)
     resp_path = out_dir / "responses.jsonl"
@@ -236,7 +244,7 @@ def main():
         "scenario": args.scenario, "domain": scenario["domain"], "event": scenario.get("event"),
         "model": args.model, "adapter": args.adapter, "system": system,
         "reasoning": not args.no_reasoning, "samples": args.samples, "temperature": args.temperature,
-        "pure_sampling": args.pure_sampling,
+        "pure_sampling": args.pure_sampling, "flip_options": args.flip_options,
         "generation_config": {k: getattr(model.generation_config, k, None) for k in ("top_p", "top_k", "temperature")},
         "max_new_tokens": args.max_new_tokens, "seed": args.seed, "device": device, "dtype": str(dtype),
         "n_layers": getattr(cfg, "num_hidden_layers", None), "d_model": getattr(cfg, "hidden_size", None),
@@ -256,9 +264,21 @@ def main():
             continue
         rows, acts = [], {k: [] for k in POSITIONS}
         for q in questions:
-            user, context = build_prompt(scenario, q, case, reasoning=not args.no_reasoning)
+            flip = args.flip_options and q.kind != "probability"
+            qs = dataclasses.replace(q, options=q.options[::-1]) if flip else q
+            user, context = build_prompt(scenario, qs, case, reasoning=not args.no_reasoning)
             for s in range(args.samples):
-                res, a = run_one(tok, model, device, system, user, context, q, args, not args.no_activations)
+                res, a = run_one(tok, model, device, system, user, context, qs, args, not args.no_activations)
+                res["flipped"] = flip
+                if flip:  # map back so answer/choice/action/option_probs use the original option order
+                    n = len(q.options)
+                    res["choice_shown"] = res["choice"]
+                    if res["answer"] is not None:
+                        res["answer"] = n - 1 - res["answer"]
+                        res["choice"] = LETTERS[res["answer"]]
+                        res["action"] = int(res["answer"] == 0) if q.kind == "binary" else None
+                    if res["option_probs"]:
+                        res["option_probs"] = res["option_probs"][::-1]
                 rows.append({
                     "case_id": case["id"], "label": case.get("label"), "question_id": q.id,
                     "kind": q.kind, "framing": q.framing, "ratio": q.ratio,
@@ -273,6 +293,8 @@ def main():
         with resp_path.open("a") as f:
             for r in rows:
                 f.write(json.dumps(r) + "\n")
+        if device == "mps":
+            torch.mps.empty_cache()
         n_ok = sum(r["parsed"] for r in rows)
         print(f"[{ci + 1}/{len(cases)}] {case['id']}: {n_ok}/{len(rows)} parsed  ({time.time() - t0:.0f}s)")
 
